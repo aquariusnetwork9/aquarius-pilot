@@ -1,0 +1,66 @@
+name: Plugin Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      # TODO: once rfresh2/ZenithProxy#313 (BotPrePhysicsTick + Bot#setFallFlying) merges upstream, delete
+      # this whole step and go back to downloading an official release, mirroring zenith-abm-bridge's
+      # build.yml:
+      #
+      #   - name: Download ZenithProxy API jar
+      #     env:
+      #       GH_TOKEN: ${{ github.token }}
+      #     run: |
+      #       mkdir -p libs
+      #       MC=$(grep '^mc=' gradle.properties | cut -d'=' -f2)
+      #       TAG=$(gh release list --repo rfresh2/ZenithProxy --limit 100 --json tagName -q '.[].tagName' \
+      #             | grep -E "\+java\.${MC}\$" | head -1)
+      #       gh release download "$TAG" --repo rfresh2/ZenithProxy --pattern 'ZenithProxy.jar' --dir libs --clobber
+      #
+      # Until then, that PR is only available on the fork branch below, so we build ZenithProxy itself from
+      # source there to get an API jar with the new hook this plugin needs.
+      - name: Build ZenithProxy API jar (fork branch, pending upstream PR #313)
+        run: |
+          git clone --depth 1 --branch feature/pre-physics-tick-hook \
+            https://github.com/aquariusnetwork9/ZenithProxy.git /tmp/zenithproxy-upstream
+          cd /tmp/zenithproxy-upstream
+          chmod +x ./gradlew
+          ./gradlew shadowJar --no-daemon
+          mkdir -p "$GITHUB_WORKSPACE/libs"
+          cp build/libs/ZenithProxy.jar "$GITHUB_WORKSPACE/libs/ZenithProxy.jar"
+
+      - name: Elevate wrapper permissions
+        run: chmod +x ./gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          dependency-graph: generate-and-submit
+
+      - name: Build Plugin
+        run: ./gradlew build
+
+      - name: Upload Plugin Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin
+          path: build/libs/*.jar
+          if-no-files-found: error

@@ -46,6 +46,18 @@ the best chestplate it can find, which means stripping the worn elytra mid-fligh
 **AntiAFK** and **AutoEat** — both enabled by default — which otherwise fight the flight for control of the
 bot. The flight's movement-input priority (`elytraPilot.inputPriority`, default 12000) outranks both.
 
+**Eating is the one deliberate exception.** `Bot` only sprints while hunger is above 6, and the e-bounce runs
+on sprint-jumping, so a flight that can never eat degrades permanently on a long haul. With
+`elytraPilot.allowEating` (default on), the flight opens a short *yield window* when hunger reaches
+`elytraPilot.eatHungerThreshold` (default 10): it keeps submitting inputs every tick, just at a priority one
+below AutoEat's, so AutoEat wins the arbitration and does its normal swap-and-eat — then the flight takes
+full priority straight back. The glide never depends on winning the input (it is held through the cached
+fall-flying bit), so a cruise eat costs almost nothing; a bounce eat costs the sprint for the ~50-tick eat
+plus a few seconds of rebuilt speed, every few minutes. The window is bounded
+(`elytraPilot.eatWindowMaxTicks`), never opens during a descent, landing, emergency or ground stop, and
+suppresses the bounce stall detector while it is open so the pause is not mistaken for an obstacle. Food is
+part of the pre-flight checklist too (`elytraPilot.preflightMinFood`), so Regear fetches it during a gear-up.
+
 A flight is always started explicitly and never resumes on its own: ElytraPilot does not auto-enable from
 its config, refuses to enable without a target (unless `elytraPilot.allowFreeFly` is set), and clears the
 target on arrival — so a proxy restart can never silently re-fly an old route. The target dimension

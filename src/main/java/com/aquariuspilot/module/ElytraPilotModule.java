@@ -17,6 +17,7 @@ import com.zenith.mc.block.Block;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.module.api.Module;
+import com.zenith.module.impl.AutoEat;
 import com.zenith.util.math.MathHelper;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.Effect;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
@@ -100,12 +101,35 @@ public class ElytraPilotModule extends Module {
     private static final double GROUND_UNKNOWN = Double.NEGATIVE_INFINITY;
     /** How many times the worn-elytra swap may be re-submitted before giving up. */
     private static final int MAX_SWAP_ATTEMPTS = 3;
+    /**
+     * Ticks the bounce stall detector stays suppressed <i>after</i> an eat window closes. The eat leaves the
+     * bot at a standstill and the sprint-jump needs a few seconds to rebuild speed; without this grace that
+     * rebuild reads as "no forward progress" and flips the flight into CRUISE, burning fireworks for nothing.
+     */
+    private static final int EAT_RECOVER_GRACE_TICKS = 100;
+    /**
+     * Ticks before another eat window may open after one closed on its cap. Keeps a bot with no food (or a
+     * disabled AutoEat) from sitting permanently yielded instead of flying.
+     */
+    private static final int EAT_YIELD_COOLDOWN_TICKS = 600;
 
     private Phase phase = Phase.IDLE;
     private int phaseTicks;
     private int bounceStallTicks;
     private int emergencyTicks;
     private int fireworkCooldown;
+
+    // ---- eat yield window (see tickEatYield) ----
+    /** True while the flight is deliberately submitting its inputs BELOW AutoEat so AutoEat wins the tick. */
+    private boolean eatYield;
+    private int eatYieldTicks;
+    /** Did AutoEat actually get an eat in during the current window? */
+    private boolean eatYieldAte;
+    /** Post-window countdown during which the bounce stall detector stays suppressed. */
+    private int eatGraceTicks;
+    private int eatYieldCooldown;
+    /** One warning per flight when a window opened and nothing ever ate. */
+    private boolean eatYieldWarned;
 
     private GroundTask groundTask = GroundTask.NONE;
     private int swapAttempts;
@@ -169,6 +193,12 @@ public class ElytraPilotModule extends Module {
         resupplyAttempts = 0;
         resupplyBestScore = Integer.MIN_VALUE;
         groundScanTick = Long.MIN_VALUE;
+        eatYield = false;
+        eatYieldTicks = 0;
+        eatYieldAte = false;
+        eatGraceTicks = 0;
+        eatYieldCooldown = 0;
+        eatYieldWarned = false;
 
         var c = cfg();
         c.enabled = true; // status mirror; enabledSetting() never reads it back
@@ -248,25 +278,166 @@ public class ElytraPilotModule extends Module {
             error("=====================================================================");
             ok = false;
         }
-        int flight = cfg().inputPriority;
+        var c = cfg();
+        int flight = c.inputPriority;
+        int antiAfk = stockPriority(extra.antiafk.priority, 5000);
         if (extra.antiafk.enabled) {
-            int p = stockPriority(extra.antiafk.priority, 5000);
             warn("ElytraPilot: AntiAFK is enabled (it is on by DEFAULT). Its walk/rotate inputs fight the "
                 + "flight and its 'reached goal' test can never match while airborne. The flight input "
                 + "priority ({}) outranks its movement inputs ({}), but its periodic swing uses priority {} "
-                + "and will still steal a tick. Run: antiafk off", flight, p, p * 10);
+                + "and will still steal a tick. Run: antiafk off", flight, antiAfk, antiAfk * 10);
         }
-        if (extra.autoEat.enabled) {
-            int p = stockPriority(extra.autoEat.priority, 11000);
-            warn("ElytraPilot: AutoEat is enabled (it is on by DEFAULT). It holds a no-input for ~50 ticks "
-                + "while eating, which drops the bounce. The flight input priority ({}) outranks it ({}), so "
-                + "the bot will NOT eat while flying - start the trip fed. Run: autoEat off", flight, p);
+        int eat = autoEatPriority();
+        if (!extra.autoEat.enabled) {
+            warn("ElytraPilot: AutoEat is DISABLED, so NOTHING will feed the bot in flight - "
+                + "elytraPilot.allowEating={} cannot change that. The bot stops sprinting entirely at hunger "
+                + "6, which is what the e-bounce runs on, so a long haul will degrade and never recover. "
+                + "Run: autoEat on", c.allowEating);
+        } else if (c.allowEating) {
+            warn("ElytraPilot: AutoEat is enabled and elytraPilot.allowEating is on - the bot WILL eat in "
+                + "flight. At hunger {} or below the flight drops its input priority from {} to {} for up to "
+                + "{}s so AutoEat ({}) wins the tick, then takes the controls straight back. In cruise that "
+                + "costs almost nothing; in the bounce it costs the sprint for the eat plus a few seconds of "
+                + "rebuilt speed, every few minutes. This is deliberate: sprinting dies at hunger 6.",
+                c.eatHungerThreshold, flight, eatYieldPriority(), c.eatWindowMaxTicks / 20, eat);
+            if (extra.antiafk.enabled && eat <= antiAfk) {
+                warn("ElytraPilot: AutoEat's priority ({}) does not outrank AntiAFK's ({}), so yielding to it "
+                    + "may hand the tick to AntiAFK instead of feeding the bot. Raise autoEat's priority or "
+                    + "run: antiafk off", eat, antiAfk);
+            }
+        } else {
+            warn("ElytraPilot: elytraPilot.allowEating is OFF - the flight input priority ({}) outranks "
+                + "AutoEat ({}) at ALL times, so the bot will NOT eat while flying. Sprinting stops working "
+                + "at hunger 6 and the e-bounce degrades from there for the rest of the trip. Start fed, keep "
+                + "the legs short, or set elytraPilot.allowEating true.", flight, eat);
         }
         return ok;
     }
 
     private static int stockPriority(@Nullable Integer configured, int fallback) {
         return Objects.requireNonNullElse(configured, fallback);
+    }
+
+    // ---------------------------------------------------------------- yielding to AutoEat
+    //
+    // The flight outranks AutoEat (inputPriority 12000 vs 11000) so AntiAFK and AutoEat cannot hijack it
+    // mid-air. Taken literally that means the bot can NEVER eat while the autopilot is on - and Bot only
+    // sprints while getFood() > 6, so once hunger reaches 6 the e-bounce can no longer build speed and stays
+    // degraded for the rest of the trip. Rather than reimplement eating here, the flight opens a short
+    // *yield window*: it keeps submitting inputs every tick, just at a priority BELOW AutoEat's, so AutoEat
+    // wins the arbitration, does its normal swap-and-eat, and the flight takes full priority straight back.
+    //
+    // Nothing about the glide depends on winning the input: Bot#updateFallFlying re-derives the glide purely
+    // from the cached self-entity metadata bit this module writes (see holdBounceGlide/holdGlide), and an
+    // InputRequest with a null input holds the current yaw/pitch. So during the window the bot keeps gliding
+    // on look direction and momentum - in CRUISE the eat is nearly free. The BOUNCE genuinely does pay:
+    // AutoEat's no-input releases forward+jump+sprint (and vanilla cancels item use when a sprint starts
+    // anyway), so the bot settles for the eat and spends a few seconds rebuilding speed afterwards.
+
+    private static @Nullable AutoEat autoEatModule() { return MODULE.get(AutoEat.class); }
+
+    /** AutoEat's effective priority - read from the module (or its config), never hardcoded: it is a knob. */
+    private static int autoEatPriority() {
+        AutoEat m = autoEatModule();
+        return m != null ? m.getPriority() : stockPriority(CONFIG.client.extra.autoEat.priority, 11000);
+    }
+
+    private static boolean autoEatEating() {
+        AutoEat m = autoEatModule();
+        return m != null && m.isEating();
+    }
+
+    /**
+     * Priority the flight submits at while the window is open: one below AutoEat, and never above what the
+     * flight would have used anyway (an operator who deliberately set {@code inputPriority} under AutoEat
+     * must not have it silently raised here).
+     */
+    private int eatYieldPriority() {
+        return Math.max(1, Math.min(cfg().inputPriority, autoEatPriority()) - 1);
+    }
+
+    /** Priority for THIS tick's movement submission. */
+    private int currentInputPriority() {
+        return eatYield ? eatYieldPriority() : cfg().inputPriority;
+    }
+
+    /**
+     * Only the two airborne cruise/bounce phases ever yield. Ground phases (PREFLIGHT, SWAP_ELYTRA,
+     * RESUPPLY) already have the bot stopped and are mid-inventory-work; DESCEND, LAND and EMERGENCY are
+     * safety-critical and an eat during one is not acceptable. TAKEOFF is excluded too: it is a few seconds
+     * long and a no-input during it drops the bot back on the ground with the takeoff half-done.
+     */
+    private boolean phaseAllowsEatYield() {
+        return phase == Phase.BOUNCE || phase == Phase.CRUISE;
+    }
+
+    /**
+     * Is it time to let AutoEat in? {@code eatHungerThreshold} is the flight's own permission gate; the health
+     * clause mirrors AutoEat's own trigger so a heal is never blocked by the flight.
+     */
+    private boolean wantsEatWindow() {
+        var p = CACHE.getPlayerCache().getThePlayer();
+        return p.getFood() <= cfg().eatHungerThreshold
+            || p.getHealth() <= CONFIG.client.extra.autoEat.healthThreshold;
+    }
+
+    /**
+     * Opens / holds / closes the yield window. Runs before the phase tick so this tick's {@link #submitMove}
+     * already uses the right priority.
+     */
+    private void tickEatYield() {
+        if (eatGraceTicks > 0) eatGraceTicks--;
+        if (eatYieldCooldown > 0) eatYieldCooldown--;
+
+        var c = cfg();
+        if (!c.allowEating || !CONFIG.client.extra.autoEat.enabled || !phaseAllowsEatYield()) {
+            closeEatYield();
+            return;
+        }
+
+        if (!eatYield) {
+            if (eatYieldCooldown > 0 || !wantsEatWindow()) return;
+            eatYield = true;
+            eatYieldTicks = 0;
+            eatYieldAte = false;
+            info("Hunger/health is low - yielding the flight controls to AutoEat (input priority {} -> {}). "
+                + "The bounce loses its sprint until the eat is done.", c.inputPriority, eatYieldPriority());
+            return;
+        }
+
+        eatYieldTicks++;
+        if (autoEatEating()) eatYieldAte = true;
+
+        // fed (or healed) and not mid-swallow: hand the controls back
+        if (!wantsEatWindow() && !autoEatEating()) {
+            if (eatYieldAte) info("AutoEat finished - the flight has the controls back at priority {}.", c.inputPriority);
+            closeEatYield();
+            return;
+        }
+
+        // Bounded, always. An indefinite yield would leave the bot to AntiAFK, which is exactly what the
+        // priority hardening exists to prevent.
+        if (eatYieldTicks > c.eatWindowMaxTicks) {
+            if (!eatYieldAte && !eatYieldWarned) {
+                eatYieldWarned = true;
+                warn("ElytraPilot: yielded to AutoEat for {}s and nothing was eaten - out of food, or AutoEat "
+                    + "cannot act. Taking the controls back at priority {}. The bot stops sprinting at hunger "
+                    + "6, so the bounce will degrade until it is fed. (Logged once per flight.)",
+                    c.eatWindowMaxTicks / 20, c.inputPriority);
+            }
+            eatYieldCooldown = EAT_YIELD_COOLDOWN_TICKS;
+            closeEatYield();
+        }
+    }
+
+    /** Restores full flight priority and starts the post-eat stall-detector grace. */
+    private void closeEatYield() {
+        if (!eatYield) return;
+        eatYield = false;
+        eatYieldTicks = 0;
+        eatYieldAte = false;
+        eatGraceTicks = EAT_RECOVER_GRACE_TICKS;
+        bounceStallTicks = 0;
     }
 
     /**
@@ -416,7 +587,10 @@ public class ElytraPilotModule extends Module {
         tickCounter++;
         if (fireworkCooldown > 0) fireworkCooldown--;
         if (notReady()) return; // deliberately does NOT advance phaseTicks: a stalled world is not progress
-        phaseTicks++;
+        tickEatYield();
+        // An eat is a deliberate pause, not phase progress: letting it advance phaseTicks would spend the
+        // phase's timeout budget on standing still and eating.
+        if (!eatYield) phaseTicks++;
         switch (phase) {
             case PREFLIGHT -> tickPreflight();
             case TAKEOFF -> tickTakeoff();
@@ -452,6 +626,9 @@ public class ElytraPilotModule extends Module {
     /** Resets every per-phase counter — leftovers used to trip the stall/emergency logic on the next phase. */
     private void goPhase(Phase p) {
         phase = p;
+        // A yield window belongs to the airborne cruise/bounce phases only - never carry one into a ground
+        // stop or an emergency descent.
+        if (!phaseAllowsEatYield()) closeEatYield();
         phaseTicks = 0;
         bounceStallTicks = 0;
         emergencyTicks = 0;
@@ -556,6 +733,7 @@ public class ElytraPilotModule extends Module {
             + Math.min(FlightGear.echestCount(), c.preflightMinEchests) * 20
             + Math.min(FlightGear.totemCount(), c.preflightMinTotems) * 10
             + Math.min(FlightGear.egapCount(), c.preflightMinEgaps) * 2
+            + Math.min(FlightGear.foodCount(), c.preflightMinFood) * 2
             + Math.min(FlightGear.fireworkCount(), c.preflightMinFireworks)
             + (FlightGear.offhandTotem() ? 5 : 0)
             + (FlightGear.hasPickaxe() ? 5 : 0);
@@ -637,7 +815,12 @@ public class ElytraPilotModule extends Module {
         if (c.bounceClearOnGround && onGround) setGlideBit(false);
 
         double bps = velocityBps();
-        if (bps < c.bounceStallSpeed) {
+        // An eat deliberately parks the bounce (AutoEat's no-input releases forward+jump+sprint) and the
+        // sprint needs a few seconds afterwards to build speed back up. Counting either as "no forward
+        // progress" would read as an obstacle and flip the flight into CRUISE, burning fireworks for nothing.
+        if (eatYield || eatGraceTicks > 0 || autoEatEating()) {
+            bounceStallTicks = 0;
+        } else if (bps < c.bounceStallSpeed) {
             if (++bounceStallTicks > c.bounceStallLimit) {
                 bounceStallTicks = 0;
                 if (c.passObstacles) {
@@ -1122,7 +1305,7 @@ public class ElytraPilotModule extends Module {
                 .build())
             .yaw(yaw)
             .pitch(pitch)
-            .priority(cfg().inputPriority)
+            .priority(currentInputPriority())
             .build());
     }
 

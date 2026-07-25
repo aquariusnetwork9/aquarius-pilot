@@ -820,7 +820,10 @@ public class RegearModule extends AbstractFieldModule {
                 int fresh = findContainerSlot(c, this::isFreshElytra);
                 if (fresh != -1 && findEmptyPlayerWindowSlot(c) != -1) { shiftClick(c, fresh); timer = cfg.actionDelayTicks; return; }
             }
-            int other = findContainerSlot(c, s -> (FlightGear.isEgap(s) || FlightGear.isTotem(s)) && FlightGear.stillNeeds(s));
+            // A mid-flight resupply tops up the consumables the flight actually burns, not just its elytras.
+            // Food is one of them: the bot eats every few minutes in flight and stops sprinting at hunger 6.
+            int other = findContainerSlot(c, s ->
+                (FlightGear.isEgap(s) || FlightGear.isTotem(s) || FlightGear.isFood(s)) && FlightGear.stillNeeds(s));
             if (other != -1 && findEmptyPlayerWindowSlot(c) != -1) { shiftClick(c, other); timer = cfg.actionDelayTicks; return; }
             go(State.CLOSE_KIT);
             return;
@@ -1314,7 +1317,8 @@ public class RegearModule extends AbstractFieldModule {
             if (inner == null || inner == Container.EMPTY_STACK) continue;
             if (FlightGear.isElytra(inner)) elytra = true;
             else if (FlightGear.isFirework(inner)) fw = true;
-            else if (FlightGear.isEgap(inner)) food = true;
+            // any edible item, not just egaps - a kit shulker packed with steak is a fed flight
+            else if (FlightGear.isFood(inner)) food = true;
             else if (FlightGear.isPickaxe(inner)) pick = true;
             else if (FlightGear.isOtherArmor(inner)) armor = true;
             else if (FlightGear.isWeapon(inner)) weapon = true;
@@ -1364,14 +1368,15 @@ public class RegearModule extends AbstractFieldModule {
         if (s == null || s == Container.EMPTY_STACK) return false;
         if (elytraRefill) {
             if (FlightGear.isElytra(s)) return countInInv(this::isFreshElytra) < elytraRefillTarget;
-            return (FlightGear.isEgap(s) || FlightGear.isTotem(s)) && FlightGear.stillNeeds(s);
+            return (FlightGear.isEgap(s) || FlightGear.isTotem(s) || FlightGear.isFood(s)) && FlightGear.stillNeeds(s);
         }
         return regearStillNeeds(s);
     }
 
     private boolean cherryPickSatisfied() {
         if (elytraRefill) return countInInv(this::isFreshElytra) >= elytraRefillTarget
-            && FlightGear.egapCountSatisfied() && FlightGear.totemCountSatisfied();
+            && FlightGear.egapCountSatisfied() && FlightGear.totemCountSatisfied()
+            && FlightGear.foodCountSatisfied();
         return regearSatisfied();
     }
 

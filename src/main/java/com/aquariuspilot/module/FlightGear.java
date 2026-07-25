@@ -2,6 +2,8 @@ package com.aquariuspilot.module;
 
 import com.aquariuspilot.AquariusPilotPlugin;
 import com.zenith.cache.data.inventory.Container;
+import com.zenith.mc.food.FoodData;
+import com.zenith.mc.food.FoodRegistry;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
@@ -9,6 +11,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.CONFIG;
 
 /**
  * Flight-readiness checklist + deficit logic, shared by {@link ElytraPilotModule} (pre-flight gating) and
@@ -34,6 +37,30 @@ public final class FlightGear {
     public static boolean isOtherArmor(ItemStack s) {
         String n = name(s);
         return n != null && (n.endsWith("_helmet") || n.endsWith("_leggings") || n.endsWith("_boots"));
+    }
+
+    /**
+     * Is this something <b>AutoEat would actually eat</b>? Deliberately not a hardcoded name list: it reads
+     * the upstream food registry ({@link FoodRegistry}, the same table AutoEat itself uses), then applies
+     * AutoEat's own filters — its {@code allowUnsafeFood} flag (rotten flesh, spider eyes, pufferfish and
+     * friends are excluded by default) and its ALL/BLACKLIST/WHITELIST {@code foods} mode. Counting food the
+     * operator's AutoEat is configured to refuse would make the pre-flight gate lie and send Regear shopping
+     * for items that will never be eaten.
+     *
+     * <p>Enchanted golden apples are food by this test as well as egaps by {@link #isEgap} — AutoEat really
+     * will eat them — so they count toward both minimums. See {@link #stillNeeds}.
+     */
+    public static boolean isFood(ItemStack s) {
+        if (s == null || s == Container.EMPTY_STACK) return false;
+        FoodData food = FoodRegistry.REGISTRY.get(s.getId());
+        if (food == null) return false;
+        var ae = CONFIG.client.extra.autoEat;
+        switch (ae.mode) {
+            case BLACKLIST -> { if (ae.foods.contains(food.name())) return false; }
+            case WHITELIST -> { if (!ae.foods.contains(food.name())) return false; }
+            case ALL -> { }
+        }
+        return ae.allowUnsafeFood || food.isSafeFood();
     }
 
     private static boolean is(ItemStack s, String name) {
@@ -161,8 +188,12 @@ public final class FlightGear {
     public static boolean hasPickaxe()   { return countItems(FlightGear::isPickaxe, false) > 0; }
     public static boolean hasWeapon()    { return countItems(FlightGear::isWeapon, false) > 0; }
 
+    /** Edible items carried (offhand included — AutoEat eats from either hand). See {@link #isFood}. */
+    public static int foodCount()        { return countItems(FlightGear::isFood, true); }
+
     public static boolean egapCountSatisfied()  { return egapCount() >= cfg().preflightMinEgaps; }
     public static boolean totemCountSatisfied() { return totemCount() >= cfg().preflightMinTotems; }
+    public static boolean foodCountSatisfied()  { return foodCount() >= cfg().preflightMinFood; }
 
     private static int countItems(java.util.function.Predicate<ItemStack> pred, boolean includeOffhand) {
         int n = 0;
@@ -197,6 +228,7 @@ public final class FlightGear {
             || totemCount() < c.preflightMinTotems
             || fireworkCount() < c.preflightMinFireworks
             || egapCount() < c.preflightMinEgaps
+            || foodCount() < c.preflightMinFood
             || (c.preflightRequirePickaxe && !hasPickaxe())
             || echestCount() < c.preflightMinEchests;
     }
@@ -210,6 +242,7 @@ public final class FlightGear {
             && (!c.preflightOffhandTotem || offhandTotem())
             && fireworkCount() >= c.preflightMinFireworks
             && egapCount() >= c.preflightMinEgaps
+            && foodCount() >= c.preflightMinFood
             && (!c.preflightRequirePickaxe || hasPickaxe())
             && echestCount() >= c.preflightMinEchests;
     }
@@ -226,6 +259,10 @@ public final class FlightGear {
             totemCount() + "/" + c.preflightMinTotems + (offhandTotem() ? ", offhand ok" : ", offhand EMPTY"));
         mark(b, "fireworks", fireworkCount() >= c.preflightMinFireworks, fireworkCount() + "/" + c.preflightMinFireworks);
         mark(b, "egaps", egapCount() >= c.preflightMinEgaps, egapCount() + "/" + c.preflightMinEgaps);
+        // sprinting stops working at hunger 6, so a flight with nothing to eat degrades permanently
+        mark(b, "food", foodCount() >= c.preflightMinFood,
+            foodCount() + "/" + c.preflightMinFood + " edible (egaps counted)"
+                + (CONFIG.client.extra.autoEat.enabled ? "" : " - AutoEat is OFF, nothing will eat it"));
         mark(b, "pickaxe", !c.preflightRequirePickaxe || hasPickaxe(), hasPickaxe() ? "ok" : "missing");
         mark(b, "echests", echestCount() >= c.preflightMinEchests, echestCount() + "/" + c.preflightMinEchests);
         return b.toString().stripTrailing();
@@ -242,10 +279,13 @@ public final class FlightGear {
         if (isOtherArmor(candidate)) return armorStillNeeded(candidate);
         if (isTotem(candidate))      return totemCount() < c.preflightMinTotems;
         if (isFirework(candidate))   return fireworkCount() < c.preflightMinFireworks;
-        if (isEgap(candidate))       return egapCount() < c.preflightMinEgaps;
+        // egaps are food as well as egaps: an egap is worth pulling if EITHER minimum is still short. Checked
+        // before the general food clause below so the egap minimum keeps its own, stricter meaning.
+        if (isEgap(candidate))       return egapCount() < c.preflightMinEgaps || foodCount() < c.preflightMinFood;
         if (isPickaxe(candidate))    return c.preflightRequirePickaxe && !hasPickaxe();
         if (isWeapon(candidate))     return c.preflightWantWeapon && !hasWeapon();
         if (isEchest(candidate))     return echestCount() < c.preflightMinEchests;
+        if (isFood(candidate))       return foodCount() < c.preflightMinFood;
         return false;
     }
 

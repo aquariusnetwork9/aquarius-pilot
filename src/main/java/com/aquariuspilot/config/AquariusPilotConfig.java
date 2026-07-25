@@ -43,8 +43,43 @@ public class AquariusPilotConfig {
          * Movement-input priority for the flight. Must outrank the stock modules that would otherwise steal
          * the bot mid-air — AntiAFK (5000 by default, and enabled by default) and AutoEat (11000). Leave the
          * <i>inventory</i> priority alone: AutoTotem (13000) must keep winning there.
+         *
+         * <p>This is the priority the flight holds <i>outside</i> the eat window — see {@link #allowEating}.
          */
         public int inputPriority = 12000;
+
+        // ---- eating in flight (the yield window; see ElytraPilotModule#tickEatYield) ----
+        /**
+         * Let AutoEat feed the bot mid-flight. {@link #inputPriority} outranks AutoEat, so without this the
+         * bot can never eat while the autopilot is on — and {@code Bot} stops sprinting entirely at hunger 6,
+         * which kills the e-bounce for the rest of the trip. With it on, the flight briefly submits its inputs
+         * <i>below</i> AutoEat's priority so AutoEat wins the tick, then takes the controls straight back.
+         *
+         * <p>Cost: in cruise, almost nothing (the glide is driven by look direction and momentum, not by
+         * movement input). In the bounce, the sprint-jump stops for the ~50-tick eat and takes a few seconds
+         * to rebuild speed afterwards. Eats happen every few minutes, so this is cheap insurance.
+         */
+        public boolean allowEating = true;
+        /**
+         * Hunger (0-20) at or below which the flight opens the yield window. This is the flight's own
+         * <i>permission gate</i>, not a trigger: AutoEat still decides when to actually eat, using its own
+         * {@code client.extra.autoEat.hungerThreshold} (10 by default). The default here matches that, so with
+         * a stock AutoEat the window opens exactly when AutoEat wants to act. Setting it lower than AutoEat's
+         * threshold holds an over-eager AutoEat back until hunger genuinely threatens the sprint. Setting it
+         * <i>higher</i> than AutoEat's does not make the bot eat sooner — it only opens a window AutoEat will
+         * not act in yet, which suppresses the bounce stall detector until the window hits
+         * {@link #eatWindowMaxTicks} and logs one "nothing was eaten" warning. Keep it at or below AutoEat's.
+         *
+         * <p>Never set at or below 6: {@code Bot} requires {@code food > 6} to sprint at all.
+         */
+        public int eatHungerThreshold = 10;
+        /**
+         * Hard cap on a single yield window, in ticks. AutoEat's own eat is 50 ticks; this allows for the
+         * food swap, a retry or two and a couple of consecutive eats. If the window ever runs this long
+         * without AutoEat eating (no food carried, AutoEat blocked), it closes and the flight takes full
+         * priority back rather than sitting yielded — an indefinite yield would hand the bot to AntiAFK.
+         */
+        public int eatWindowMaxTicks = 400;
 
         // ---- e-bounce (ground bounce; per-tick glide-state hold — see ElytraPilotModule#holdBounceGlide) ----
         public boolean bounceEnabled = true;
@@ -111,6 +146,15 @@ public class AquariusPilotConfig {
         public boolean preflightOffhandTotem = true;
         public int preflightMinFireworks = 64;
         public int preflightMinEgaps = 0;
+        /**
+         * Edible items the bot must carry before it will take off. A bot that launches with nothing to eat
+         * runs its hunger down to 6, loses sprint and degrades the e-bounce permanently — and the egap
+         * minimum above defaults to 0, so before this existed nothing on the checklist required food at all.
+         * Counted with the upstream food registry ({@code com.zenith.mc.food.FoodRegistry}) and filtered the
+         * way AutoEat filters, so it only counts food AutoEat would actually eat. Enchanted golden apples are
+         * food too and count toward BOTH this and {@link #preflightMinEgaps}.
+         */
+        public int preflightMinFood = 16;
         public boolean preflightRequirePickaxe = true;
         public boolean preflightWantWeapon = false;
         public int preflightMinEchests = 1;
@@ -193,6 +237,11 @@ public class AquariusPilotConfig {
 
         // --- flight loop -------------------------------------------------------------------------------
         e.inputPriority = clampI(changes, "elytraPilot.inputPriority", e.inputPriority, 1, 1_000_000);
+        // hunger is 0..20 and Bot refuses to sprint at all at 6, so a window that only opens at or below
+        // that can never save the bounce; 20 would mean "always hungry" and hold the window open forever
+        e.eatHungerThreshold = clampI(changes, "elytraPilot.eatHungerThreshold", e.eatHungerThreshold, 7, 19);
+        // AutoEat's own eat is 50 ticks - a cap below that could close the window mid-swallow every time
+        e.eatWindowMaxTicks = clampI(changes, "elytraPilot.eatWindowMaxTicks", e.eatWindowMaxTicks, 60, 6000);
         e.arriveRadius = clampD(changes, "elytraPilot.arriveRadius", e.arriveRadius, 4, 10_000);
         e.roadY = clampI(changes, "elytraPilot.roadY", e.roadY, -64, 319);
         e.roadDropAbort = clampI(changes, "elytraPilot.roadDropAbort", e.roadDropAbort, 1, 384);
@@ -233,6 +282,7 @@ public class AquariusPilotConfig {
         e.preflightMinTotems = clampI(changes, "elytraPilot.preflightMinTotems", e.preflightMinTotems, 0, 36 * 64);
         e.preflightMinFireworks = clampI(changes, "elytraPilot.preflightMinFireworks", e.preflightMinFireworks, 0, 36 * 64);
         e.preflightMinEgaps = clampI(changes, "elytraPilot.preflightMinEgaps", e.preflightMinEgaps, 0, 36 * 64);
+        e.preflightMinFood = clampI(changes, "elytraPilot.preflightMinFood", e.preflightMinFood, 0, 36 * 64);
         e.preflightMinEchests = clampI(changes, "elytraPilot.preflightMinEchests", e.preflightMinEchests, 0, 36 * 64);
         e.gearUpMaxAttempts = clampI(changes, "elytraPilot.gearUpMaxAttempts", e.gearUpMaxAttempts, 1, 5);
         e.groundPhaseTimeoutTicks = clampI(changes, "elytraPilot.groundPhaseTimeoutTicks", e.groundPhaseTimeoutTicks, 400, 144_000);

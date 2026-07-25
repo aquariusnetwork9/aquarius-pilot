@@ -36,6 +36,12 @@ import static com.zenith.Globals.INVENTORY;
  * kit shulker (falling back to a content-based cherry-pick search across every shulker in the chest if no
  * single shulker matches), empty it into the inventory, break + recover the emptied shulker, return it,
  * recover the ender chest with a silk-touch pickaxe, then equip armour + offhand totem.
+ *
+ * <p>Cherry-pick is a first-class storage layout, not just a fallback: with
+ * {@code regear.singleItemShulkers} the primary kit match is skipped outright and every round pulls only
+ * still-needed items out of the richest matching shulker, which is how separate single-item shulkers (an
+ * elytra shulker, a rocket shulker, a boots shulker, ...) are meant to be consumed. What counts as
+ * "still needed" is {@link #regearStillNeeds}, driven by the full pre-flight checklist.
  */
 public class RegearModule extends AbstractFieldModule {
 
@@ -312,12 +318,23 @@ public class RegearModule extends AbstractFieldModule {
         if (c == null) { timer = cfg.actionDelayTicks; return; }
         if (findPlayerWindowSlot(c, this::isShulkerBox) != -1) { go(State.CLOSE_ECHEST); return; }
 
+        // Single-item-shulker storage: skip the primary kit match entirely and cherry-pick from round 0, so a
+        // shulker that merely *scores* as a kit is never dumped wholesale when selective pulls were wanted.
+        // Not applied to elytraRefill, whose EMPTY_KIT branch also needs an open shulker to dump SPENT elytras
+        // into and so must still fall back to the primary match when nothing holds a fresh one.
+        boolean singleItem = cfg.singleItemShulkers && cfg.cherryPickFallback && !elytraRefill;
+
         int src;
         if (cherryPickAttempts == 0) {
-            src = cfg.matchByContents ? findBestKitShulkerSlot(c) : findContainerSlot(c, this::isKitShulker);
-            if (src == -1 && cfg.cherryPickFallback) {
+            if (singleItem) {
                 src = findRichestShulkerSlot(c, this::cherryPickStillNeeds);
                 if (src != -1) cherryPickAttempts = 1;
+            } else {
+                src = cfg.matchByContents ? findBestKitShulkerSlot(c) : findContainerSlot(c, this::isKitShulker);
+                if (src == -1 && cfg.cherryPickFallback) {
+                    src = findRichestShulkerSlot(c, this::cherryPickStillNeeds);
+                    if (src != -1) cherryPickAttempts = 1;
+                }
             }
         } else {
             src = findRichestShulkerSlot(c, this::cherryPickStillNeeds);
@@ -327,6 +344,10 @@ public class RegearModule extends AbstractFieldModule {
             if (cherryPickAttempts > 0) {
                 info("Regear: cherry-pick found no more shulkers with missing items - continuing with what's gathered.");
                 go(ownEchest ? State.RECOVER_ECHEST : State.GEAR_UP);
+                return;
+            }
+            if (singleItem) {
+                abort("single-item-shulker mode: no shulker in the ender chest holds anything still needed");
                 return;
             }
             String primary = cfg.matchByContents ? "no shulker matching the flight-kit contents (elytra + fireworks)"
@@ -401,8 +422,15 @@ public class RegearModule extends AbstractFieldModule {
             ? findContainerSlot(c, s -> s != Container.EMPTY_STACK && cherryPickStillNeeds(s))
             : findContainerSlot(c, s -> s != Container.EMPTY_STACK);
         if (src == -1) { go(State.CLOSE_KIT); return; }
+        // Applies to the cherry-pick branch too (this runs before every shift-click, in both branches) - and
+        // matters much more there, since pulling from up to cherryPickMaxShulkers shulkers fills the inventory
+        // far more readily than emptying one kit does. Abort loudly rather than quietly gearing up short.
         if (emptyMainSlots() <= 0 && countInInv(s -> s == Container.EMPTY_STACK) == 0) {
-            abort("inventory full while emptying the kit"); return;
+            abort(cherryPickAttempts > 0
+                ? "inventory full while cherry-picking (shulker " + cherryPickAttempts + "/" + cfg.cherryPickMaxShulkers
+                    + ") - start with a clearer inventory, or lower the pre-flight minimums"
+                : "inventory full while emptying the kit");
+            return;
         }
         if (!inventoryBusy()) shiftClick(c, src);
         timer = cfg.actionDelayTicks;
@@ -601,7 +629,31 @@ public class RegearModule extends AbstractFieldModule {
         return regearSatisfied();
     }
 
+    /**
+     * What a standalone (non-{@code elytraRefill}) gear-up still wants out of the ender chest: the union of
+     * <ul>
+     *   <li>the <b>equip</b> needs — an elytra to wear, an empty armour slot to fill, an empty offhand to put
+     *       a totem in. This is about equipping, not merely possessing, so it stays even when the count-based
+     *       checklist is already satisfied by items sitting in the inventory; and</li>
+     *   <li>the full count-based <b>pre-flight checklist</b> ({@link FlightGear#stillNeeds}) — spare elytras,
+     *       fireworks, gapples, a pickaxe, an ender chest — gated on {@code regear.fillFlightChecklist}.</li>
+     * </ul>
+     * Before {@code fillFlightChecklist} existed this was the equip half only, so a standalone gear-up never
+     * fetched fireworks / gapples / a pickaxe / an ender chest / a second elytra and Regear would report
+     * "complete" while ElytraPilot's pre-flight gate (which uses the checklist) still refused to fly.
+     */
     private boolean regearStillNeeds(ItemStack s) {
+        if (equipStillNeeds(s)) return true;
+        return AquariusPilotPlugin.PLUGIN_CONFIG.regear.fillFlightChecklist && FlightGear.stillNeeds(s);
+    }
+
+    /** Is there anything left that a further shulker could fix? Mirror of {@link #regearStillNeeds}. */
+    private boolean regearSatisfied() {
+        if (!equipSatisfied()) return false;
+        return !AquariusPilotPlugin.PLUGIN_CONFIG.regear.fillFlightChecklist || !FlightGear.anySupplyDeficit();
+    }
+
+    private boolean equipStillNeeds(ItemStack s) {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         String n = itemName(s);
         if (n == null) return false;
@@ -624,7 +676,7 @@ public class RegearModule extends AbstractFieldModule {
         return false;
     }
 
-    private boolean regearSatisfied() {
+    private boolean equipSatisfied() {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         if (cfg.equipElytra && !wornIsElytra() && findInInv(s -> "elytra".equals(itemName(s))) == -1) return false;
         if (cfg.equipArmor) {

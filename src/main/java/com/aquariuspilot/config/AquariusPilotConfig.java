@@ -100,7 +100,16 @@ public class AquariusPilotConfig {
         public boolean returnShulker = true;
 
         public boolean cherryPickFallback = true;
-        public int cherryPickMaxShulkers = 6;
+        /** A full single-item gear-up can need ~9 shulkers (elytra, helmet, leggings, boots, totem,
+         *  fireworks, gapples, pickaxe, echest), so this has headroom over that. */
+        public int cherryPickMaxShulkers = 12;
+        /** Cherry-pick against the FULL pre-flight checklist ({@link com.aquariuspilot.module.FlightGear}),
+         *  not just what needs equipping. Set false for the old equip-only behaviour (elytra to wear, empty
+         *  armour slots, offhand totem) if you run Regear standalone and don't want it hauling fireworks. */
+        public boolean fillFlightChecklist = true;
+        /** Storage is separate single-item shulkers (one per item type) rather than a hand-packed kit:
+         *  skip the primary kit-shulker match entirely and cherry-pick from the first round. */
+        public boolean singleItemShulkers = false;
 
         public int echestScanRadius = 24;
         public boolean selfKillRelocate = false;

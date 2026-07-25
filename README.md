@@ -40,9 +40,13 @@ Also required:
 - **ElytraPilot** (`.aqp fly ...`) — pre-flight gear check, takeoff, the ground e-bounce, a
   firework-sustained cruise glide, elytra-wear-aware mid-flight resupply (hands off to Regear), landing, and
   an optional goal-stop logout.
-- **Regear** (`.aqp regear ...`) — gear up from a kit shulker in a carried or nearby ender chest: name /
-  colour / contents matching, a cherry-pick fallback across every shulker in the chest when no single one
-  matches, armour + offhand totem equip, and the e-bounce mid-flight elytra-only refill mode.
+- **Regear** (`.aqp regear ...`) — gear up from an ender chest, carried or placed nearby. Storage can be a
+  single hand-packed kit shulker (matched by name / colour / contents) **or separate single-item shulkers**
+  — one for elytras, one for rockets, one per armour piece and so on — which Regear consumes by cherry
+  -picking only the still-missing items out of each, up to `cherryPickMaxShulkers` (12) of them. What counts
+  as missing is the full pre-flight checklist (`regear.fillFlightChecklist`, on by default), so a gear-up
+  that reports complete actually clears ElytraPilot's pre-flight gate. Also does armour + offhand totem
+  equip, and the e-bounce mid-flight elytra-only refill mode.
 
 ## Known limitations (deferred from the ~8,000-line AquariusProxy source)
 

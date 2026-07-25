@@ -92,10 +92,20 @@ public final class FlightGear {
 
     public static boolean anyDeficit() {
         var c = cfg();
+        return anySupplyDeficit() || (c.preflightOffhandTotem && !offhandTotem());
+    }
+
+    /**
+     * {@link #anyDeficit()} minus the offhand-totem clause. That one clause is an <i>equip</i> state, not a
+     * supply shortfall: no amount of pulling items out of shulkers can satisfy it (Regear's GEAR_UP phase
+     * moves a totem to the offhand at the very end of the cycle). Including it in Regear's cherry-pick
+     * satisfaction test would keep the loop opening shulkers until it hit its cap on every single run.
+     */
+    public static boolean anySupplyDeficit() {
+        var c = cfg();
         return elytraCount() < Math.max(1, c.preflightMinElytras)
             || armorPiecesAnywhere() < c.preflightMinArmor
             || totemCount() < c.preflightMinTotems
-            || (c.preflightOffhandTotem && !offhandTotem())
             || fireworkCount() < c.preflightMinFireworks
             || egapCount() < c.preflightMinEgaps
             || (c.preflightRequirePickaxe && !hasPickaxe())

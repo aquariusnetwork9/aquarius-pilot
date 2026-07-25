@@ -63,6 +63,32 @@ public final class FlightGear {
         return n;
     }
 
+    // ---------------------------------------------------------------- armor slots (helmet / leggings / boots)
+
+    private static final EquipmentSlot[] ARMOR_SLOTS =
+        {EquipmentSlot.HELMET, EquipmentSlot.LEGGINGS, EquipmentSlot.BOOTS};
+    private static final String[] ARMOR_SUFFIX = {"_helmet", "_leggings", "_boots"};
+
+    /** Which of {@link #ARMOR_SLOTS} this piece belongs in, or -1 if it is not helmet/leggings/boots. */
+    private static int armorSlotIndex(ItemStack s) {
+        String n = name(s);
+        if (n == null) return -1;
+        for (int i = 0; i < ARMOR_SUFFIX.length; i++) if (n.endsWith(ARMOR_SUFFIX[i])) return i;
+        return -1;
+    }
+
+    /** Is that slot already accounted for - worn, or a piece for it already sitting in the inventory? */
+    private static boolean slotCovered(int idx) {
+        if (worn(ARMOR_SLOTS[idx]) != Container.EMPTY_STACK) return true;
+        final String suffix = ARMOR_SUFFIX[idx];
+        return countItems(s -> { String n = name(s); return n != null && n.endsWith(suffix); }, false) > 0;
+    }
+
+    private static boolean allArmorSlotsCovered() {
+        for (int i = 0; i < ARMOR_SLOTS.length; i++) if (!slotCovered(i)) return false;
+        return true;
+    }
+
     public static boolean offhandTotem() { return isTotem(worn(EquipmentSlot.OFF_HAND)); }
     public static int totemCount()       { return countItems(FlightGear::isTotem, true); }
     public static int fireworkCount()    { return countItems(FlightGear::isFirework, false); }
@@ -148,7 +174,7 @@ public final class FlightGear {
     public static boolean stillNeeds(ItemStack candidate) {
         var c = cfg();
         if (isElytra(candidate))     return elytraCount() < Math.max(1, c.preflightMinElytras);
-        if (isOtherArmor(candidate)) return armorPiecesAnywhere() < c.preflightMinArmor;
+        if (isOtherArmor(candidate)) return armorStillNeeded(candidate);
         if (isTotem(candidate))      return totemCount() < c.preflightMinTotems;
         if (isFirework(candidate))   return fireworkCount() < c.preflightMinFireworks;
         if (isEgap(candidate))       return egapCount() < c.preflightMinEgaps;
@@ -156,5 +182,22 @@ public final class FlightGear {
         if (isWeapon(candidate))     return c.preflightWantWeapon && !hasWeapon();
         if (isEchest(candidate))     return echestCount() < c.preflightMinEchests;
         return false;
+    }
+
+    /**
+     * Slot-aware armour want, for {@link #stillNeeds}. The pre-flight gate itself stays a plain count
+     * ({@link #armorPiecesAnywhere()} vs {@code preflightMinArmor}), but asking that count whether a given
+     * <i>piece</i> is wanted makes every piece read as wanted while the total is short - so with
+     * {@code regear.singleItemShulkers} storage Regear would empty the helmet shulker of two or three helmets
+     * before it ever reached the leggings and boots shulkers. Instead: cover each bare slot once first, and
+     * only once the bot is fully clothed does a spare piece count toward a {@code preflightMinArmor} that has
+     * been deliberately set above three.
+     */
+    private static boolean armorStillNeeded(ItemStack candidate) {
+        if (armorPiecesAnywhere() >= cfg().preflightMinArmor) return false;   // already satisfied
+        int idx = armorSlotIndex(candidate);
+        if (idx == -1) return false;
+        if (!slotCovered(idx)) return true;                                   // fill this bare slot
+        return allArmorSlotsCovered();                                        // fully clothed: stock spares
     }
 }

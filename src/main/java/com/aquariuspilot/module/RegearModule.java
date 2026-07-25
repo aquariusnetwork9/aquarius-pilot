@@ -63,6 +63,9 @@ public class RegearModule extends AbstractFieldModule {
     private @Nullable BlockPos shulkPos;
     private @Nullable ItemData kitShulkerItem;
     private @Nullable BlockPos avoidSpot;
+    /** Shulker boxes carried on entry to {@link State#BREAK_KIT}, {@code -1} when not in that state. Needs its
+     *  own field rather than reusing {@code step}, which {@link #go} zeroes on every state change. */
+    private int shulkerBaseline = -1;
 
     private boolean paused;
     private boolean complete;
@@ -100,6 +103,7 @@ public class RegearModule extends AbstractFieldModule {
         relocateAttempts = 0;
         relocateForceKill = false; pathBestDist = Double.MAX_VALUE; pathStuckTicks = 0;
         ownEchest = false; echPos = null; shulkPos = null; pathGoal = null; kitShulkerItem = null; avoidSpot = null;
+        shulkerBaseline = -1;
         var c = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         if (c.selfKillRelocate) {
             go(State.RELOCATE);
@@ -107,6 +111,12 @@ public class RegearModule extends AbstractFieldModule {
         } else {
             go(State.ACQUIRE);
             info("Regear: starting - looking for the kit shulker.");
+        }
+        int carried = countInInv(this::isShulkerBox);
+        if (carried > 0) {
+            warn("Regear: starting while already carrying {} shulker box(es). PULL_KIT treats a shulker already "
+                + "in the inventory as the kit, so Regear may place, empty and break one of yours instead of "
+                + "pulling one from the ender chest. Stash unrelated shulkers before gearing up.", carried);
         }
     }
 
@@ -117,10 +127,11 @@ public class RegearModule extends AbstractFieldModule {
         state = State.IDLE;
         elytraRefill = false;
         echPos = null; shulkPos = null; pathGoal = null; kitShulkerItem = null; avoidSpot = null;
+        shulkerBaseline = -1;
     }
 
     private void onStarting(ClientBotTick.Starting event) {
-        if (state != State.IDLE && !complete) { go(State.ACQUIRE); }
+        if (state != State.IDLE && !complete) { shulkerBaseline = -1; go(State.ACQUIRE); }
     }
 
     private void go(State s) { state = s; step = 0; timer = 0; attempts = 0; }
@@ -131,6 +142,7 @@ public class RegearModule extends AbstractFieldModule {
         paused = true;
         state = State.IDLE;
         elytraRefill = false;
+        shulkerBaseline = -1;
         warn("Regear paused: {}. Toggle .aqp regear off/on to retry.", reason);
         inGameAlertActivePlayer("<red>Regear paused: " + reason);
     }
@@ -438,16 +450,32 @@ public class RegearModule extends AbstractFieldModule {
 
     private void tickBreakKit() {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
+        // Baseline the carried shulkers on the first tick here, while the kit is still a placed block, so the
+        // pickup wait below is looking for *the broken kit* arriving in the inventory rather than for any
+        // shulker at all: a shulker the bot happened to already carry used to satisfy the check immediately
+        // and the real drop was left on the ground. Reset to -1 on every exit so each cherry-pick round
+        // re-baselines instead of inheriting the previous round's count.
+        if (shulkerBaseline < 0) shulkerBaseline = countInInv(this::isShulkerBox);
         if (placed(shulkPos)) {
             if (++attempts > 200) { abort("couldn't break the kit shulker"); return; }
             breakAt(shulkPos, true);
             return;
         }
         if (!BARITONE.isActive()) BARITONE.pickup();
-        boolean collected = countInInv(this::isShulkerBox) > 0;
-        if (collected || ++step > 60) {
+        boolean collected = countInInv(this::isShulkerBox) > shulkerBaseline;
+        boolean gaveUp = !collected && ++step > 60;
+        if (collected || gaveUp) {
             if (BARITONE.isActive()) BARITONE.stop();
-            shulkPos = null; attempts = 0;
+            if (gaveUp) {
+                warn("Regear: broke the kit shulker at {} but never picked it up (gave up after ~{} ticks). "
+                    + "It is most likely still lying on the ground there - out of reach, burnt/despawned, or the "
+                    + "chunk hiccuped - and on a cherry-pick round it still holds everything that wasn't taken. "
+                    + "Go recover it. Continuing the gear-up with what's already gathered.",
+                    shulkPos, 60 * Math.max(1, cfg.actionDelayTicks));
+                inGameAlertActivePlayer("<yellow>Regear: broken kit shulker was not picked up - it may still be "
+                    + "on the ground with items inside");
+            }
+            shulkPos = null; attempts = 0; shulkerBaseline = -1;
             go(State.CHERRY_CHECK);
         } else {
             timer = cfg.actionDelayTicks;

@@ -3,7 +3,8 @@
 A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that ports the elytra long-haul flight
 autopilot ("ElytraPilot") and gear-up module ("Regear") from the
 [AquariusProxy](https://github.com/aquariusnetwork9/AquariusProxy) fork into a standalone plugin for
-**stock** ZenithProxy — so it works for any ZenithProxy user, not just the fork.
+**stock** ZenithProxy — it runs on official ZenithProxy releases, with no core patches, so it works for any
+ZenithProxy user, not just the fork.
 
 Command prefix: **`.aqp`** (e.g. `.aqp fly on`, `.aqp fly to 100 -200`, `.aqp regear on`).
 
@@ -33,15 +34,6 @@ Also required:
   compiled bytecode itself targets Java 21, matching what ZenithProxy runs.
 - `dev.babbaj:nether-pathfinder:1.6` (native nether A* library) — added automatically as a build dependency
   and shaded into the plugin jar; ships native binaries for linux/windows/macos.
-
-### Temporary build dependency (until upstream PR #313 merges)
-
-This plugin uses `com.zenith.event.client.BotPrePhysicsTick` and the public `Bot#setFallFlying(boolean)`,
-both proposed in [rfresh2/ZenithProxy#313](https://github.com/rfresh2/ZenithProxy/pull/313) and **not yet
-merged upstream**. Until it merges, this plugin must be compiled against a ZenithProxy jar built from the
-`aquariusnetwork9/ZenithProxy` fork's `feature/pre-physics-tick-hook` branch, not an official release — see
-`.github/workflows/build.yml`/`publish.yml` (they build that branch from source in CI) and the `TODO`
-comments in both for exactly what to change once the PR merges.
 
 ## What this is
 
@@ -80,8 +72,11 @@ of tuning built up over many iterations on 2b2t. Ported in full: the container/p
 ./gradlew build
 ```
 
-Place a ZenithProxy jar at `libs/ZenithProxy.jar` (see "Temporary build dependency" above for which one),
-or point at one with `-Pzenith_jar=/path/to/ZenithProxy.jar`.
+Place a ZenithProxy jar at `libs/ZenithProxy.jar`, or point at one with
+`-Pzenith_jar=/path/to/ZenithProxy.jar`. Any official
+[rfresh2/ZenithProxy release](https://github.com/rfresh2/ZenithProxy/releases) jar for the MC version in
+`gradle.properties` works (the `+java.1.21.4` release channel) — CI fetches one the same way, see
+`.github/workflows/build.yml`.
 
 ## Installing
 

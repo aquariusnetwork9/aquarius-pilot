@@ -20,31 +20,21 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
 
-      # TODO: once rfresh2/ZenithProxy#313 (BotPrePhysicsTick + Bot#setFallFlying) merges upstream, delete
-      # this whole step and go back to downloading an official release, mirroring zenith-abm-bridge's
-      # publish.yml:
-      #
-      #   - name: Download ZenithProxy API jar
-      #     env:
-      #       GH_TOKEN: ${{ github.token }}
-      #     run: |
-      #       mkdir -p libs
-      #       MC=$(grep '^mc=' gradle.properties | cut -d'=' -f2)
-      #       TAG=$(gh release list --repo rfresh2/ZenithProxy --limit 100 --json tagName -q '.[].tagName' \
-      #             | grep -E "\+java\.${MC}\$" | head -1)
-      #       gh release download "$TAG" --repo rfresh2/ZenithProxy --pattern 'ZenithProxy.jar' --dir libs --clobber
-      #
-      # Until then, that PR is only available on the fork branch below, so we build ZenithProxy itself from
-      # source there to get an API jar with the new hook this plugin needs.
-      - name: Build ZenithProxy API jar (fork branch, pending upstream PR #313)
+      - name: Download ZenithProxy API jar
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git clone --depth 1 --branch feature/pre-physics-tick-hook \
-            https://github.com/aquariusnetwork9/ZenithProxy.git /tmp/zenithproxy-upstream
-          cd /tmp/zenithproxy-upstream
-          chmod +x ./gradlew
-          ./gradlew shadowJar --no-daemon
-          mkdir -p "$GITHUB_WORKSPACE/libs"
-          cp build/libs/ZenithProxy.jar "$GITHUB_WORKSPACE/libs/ZenithProxy.jar"
+          mkdir -p libs
+          MC=$(grep '^mc=' gradle.properties | cut -d'=' -f2)
+          # Pin to the newest stable +java.<mc> channel so the API we compile against
+          # matches the MC version this plugin targets (not whatever the latest release happens to be).
+          TAG=$(gh release list --repo rfresh2/ZenithProxy --limit 100 --json tagName -q '.[].tagName' \
+                | grep -E "\+java\.${MC}\$" | head -1)
+          if [ -z "$TAG" ]; then
+            echo "No +java.${MC} ZenithProxy release found" >&2; exit 1
+          fi
+          echo "Compiling against ZenithProxy $TAG"
+          gh release download "$TAG" --repo rfresh2/ZenithProxy --pattern 'ZenithProxy.jar' --dir libs --clobber
 
       - name: Elevate wrapper permissions
         run: chmod +x ./gradlew

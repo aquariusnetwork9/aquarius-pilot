@@ -24,8 +24,8 @@ Source: `aquariusnetwork9/AquariusProxy`, branch `dev/regear-echest-mend`, packa
 ## Reimplemented (not a line-for-line port)
 
 - `ElytraPilot` (~3,439 lines) → `com.aquariuspilot.module.ElytraPilotModule` (~450 lines). Keeps: pre
-  -flight gating + auto gear-up handoff to Regear, takeoff, the ground e-bounce (via the new
-  `BotPrePhysicsTick` hook + `Bot#setFallFlying`), a firework cruise glide, elytra-wear-aware mid-flight
+  -flight gating + auto gear-up handoff to Regear, takeoff, the ground e-bounce (a per-tick glide-state
+  hold driven through the entity metadata cache on stock APIs), a firework cruise glide, elytra-wear-aware mid-flight
   resupply, landing, and an optional goal-stop logout. The fork's version accumulated dozens of specific
   hardening passes (see its own `EBOUNCE_LOG.md`) — this plugin ports the core technique and the load
   -bearing safety checks (setback/frontier holds are simplified to a stall counter; the road-drop recovery
@@ -53,7 +53,3 @@ Source: `aquariusnetwork9/AquariusProxy`, branch `dev/regear-echest-mend`, packa
 1. Wire `NetherRouter` into a real nether-routed cruise leg (currently ported but unused).
 2. Port `HighwayGraph` + `GriefMap` for ring-road rerouting around griefed highway sections.
 3. Bed/anchor set-spawn for goal-stop.
-4. Once [rfresh2/ZenithProxy#313](https://github.com/rfresh2/ZenithProxy/pull/313) merges upstream, switch
-   `.github/workflows/build.yml`/`publish.yml` back to downloading an official `+java.1.21.4` release
-   instead of building the `aquariusnetwork9/ZenithProxy` fork branch from source (see the `TODO`s in both
-   files).

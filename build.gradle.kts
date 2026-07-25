@@ -35,11 +35,9 @@ repositories {
 // --- ZenithProxy API jar ------------------------------------------------------
 // Plugins compile against the ZenithProxy "fat" jar — the exact jar the launcher runs. It bundles the
 // entire API plus the @Plugin annotation processor that emits your plugin's metadata file
-// (zenithproxy.plugin.json). No Maven publishing needed.
-//
-// NOTE: until rfresh2/ZenithProxy#313 (BotPrePhysicsTick + Bot#setFallFlying) is merged upstream, the jar
-// this must point at is one built from the aquariusnetwork9/ZenithProxy fork's feature/pre-physics-tick-hook
-// branch, NOT an official release. See .github/workflows/build.yml for how CI produces it.
+// (zenithproxy.plugin.json). No Maven publishing needed. Any official rfresh2/ZenithProxy release jar for
+// the MC version in gradle.properties works (the `+java.<mc>` release channel) — see
+// .github/workflows/build.yml for how CI fetches one.
 val zenithJarPath: String = providers.gradleProperty("zenith_jar")
     .orElse(layout.projectDirectory.file("libs/ZenithProxy.jar").asFile.absolutePath)
     .get()
@@ -65,9 +63,9 @@ val checkZenithJar = tasks.register("checkZenithJar") {
                 "\nZenithProxy API jar not found at:\n  $path\n\n" +
                 "Place a ZenithProxy fat jar at libs/ZenithProxy.jar, or point the build at one with:\n" +
                 "  -Pzenith_jar=/path/to/ZenithProxy.jar\n\n" +
-                "Until rfresh2/ZenithProxy#313 merges, this MUST be built from the\n" +
-                "aquariusnetwork9/ZenithProxy fork, branch feature/pre-physics-tick-hook — an official\n" +
-                "release jar will NOT compile (missing BotPrePhysicsTick / Bot#setFallFlying).\n"
+                "Any official rfresh2/ZenithProxy release jar for the MC version in gradle.properties\n" +
+                "works (the +java.<mc> release channel):\n" +
+                "  gh release download <tag> --repo rfresh2/ZenithProxy --pattern ZenithProxy.jar --dir libs\n"
             )
         }
     }

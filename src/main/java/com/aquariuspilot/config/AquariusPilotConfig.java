@@ -18,12 +18,14 @@ public class AquariusPilotConfig {
         /** Gate e-bounce entirely until CONFIG.client.viaversion reports protocol 765 (1.20.3-1.20.4). See README. */
         public boolean requireProtocolCheck = true;
 
-        // ---- e-bounce (ground bounce via BotPrePhysicsTick + Bot#setFallFlying) ----
+        // ---- e-bounce (ground bounce; per-tick glide-state hold — see ElytraPilotModule#holdBounceGlide) ----
         public boolean bounceEnabled = true;
         public int roadY = 120;
         public int roadDropAbort = 8;
         public boolean bounceClearOnGround = true;
         public double bounceDeployHeight = 0.3;
+        /** Only re-engage the glide while vertical velocity is below this: the rise stays ballistic, the glide catches the descent. */
+        public double bounceRedeployMaxVy = 5.0;
         public double bounceSpeed = 38.0;          // target b/s before dropping sprint
         public double bounceStallSpeed = 3.0;      // b/s below which we count stall ticks
         public int bounceStallLimit = 60;

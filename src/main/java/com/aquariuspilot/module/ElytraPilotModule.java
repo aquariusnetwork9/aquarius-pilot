@@ -3,7 +3,6 @@ package com.aquariuspilot.module;
 import com.aquariuspilot.AquariusPilotPlugin;
 import com.github.rfresh2.EventConsumer;
 import com.zenith.cache.data.inventory.Container;
-import com.zenith.event.client.BotPrePhysicsTick;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.SetHeldItem;
@@ -13,9 +12,14 @@ import com.zenith.feature.player.InputRequest;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.module.api.Module;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.Effect;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.type.ByteEntityMetadata;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerState;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
+import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundPlayerCommandPacket;
 
 import java.util.List;
@@ -39,15 +43,16 @@ import static com.zenith.Globals.MODULE;
  * physics solver / obstacle pass, bed/anchor set-spawn, XP-bottle Mending choreography, AirPlace-based
  * escape portals). See the repo README's "Known limitations" and ROADMAP.md for the full list.
  *
- * <h2>The e-bounce, and the new hook it depends on</h2>
- * AquariusProxy's bounce works by holding {@code forward+jump} and re-deploying fall-flying every airborne
- * tick from INSIDE {@code Bot}'s own tick (after it applies the server's metadata sync, before physics
- * runs) — a fork-only method ({@code Bot.requestBounceRedeploy}) that a stock plugin cannot call. This
- * plugin instead subscribes to {@link BotPrePhysicsTick} (proposed in rfresh2/ZenithProxy#313, not yet
- * merged — see the repo README) and calls the new public {@code Bot#setFallFlying(boolean)} from that
- * handler, which runs at exactly the same point in the tick. The redeploy TIMING logic (should we force
- * fall-flying this tick?) lives entirely in this plugin's {@link #onPrePhysics} — core does nothing bounce
- * -specific anymore.
+ * <h2>How the e-bounce holds the glide</h2>
+ * The bounce re-engages fall-flying every airborne tick. On stock ZenithProxy this is done entirely from
+ * this module, with no core changes: ZenithProxy runs the whole client tick and all inbound packet handling
+ * serialized on one event loop, and module {@link ClientBotTick} subscribers (default priority) run earlier
+ * in that single dispatch than {@code Bot}'s own tick ({@code Bot.TICK_PRIORITY}). {@code Bot} re-derives
+ * its fall-flying state at the start of each tick from the cached self-entity metadata (the shared flags
+ * byte at index 0, bit {@code 0x80} — the same bit its own deploy path sets), so {@link #tickBounce} writes
+ * that bit through the entity cache just before {@code Bot} reads it: the physics step glides that very
+ * same tick, and anything the server pushes into the cache between ticks is re-applied on the next tick
+ * before it is ever consumed. See {@link #holdBounceGlide}.
  */
 public class ElytraPilotModule extends Module {
 
@@ -56,7 +61,6 @@ public class ElytraPilotModule extends Module {
     private Phase phase = Phase.IDLE;
     private int phaseTicks;
     private int bounceStallTicks;
-    private boolean wantBounceRedeploy;
     private int emergencyTicks;
 
     private static com.aquariuspilot.config.AquariusPilotConfig.ElytraPilot cfg() {
@@ -71,8 +75,7 @@ public class ElytraPilotModule extends Module {
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
-            of(ClientBotTick.class, this::onTick),
-            of(BotPrePhysicsTick.class, this::onPrePhysics)
+            of(ClientBotTick.class, this::onTick)
         );
     }
 
@@ -81,7 +84,6 @@ public class ElytraPilotModule extends Module {
         phase = Phase.IDLE;
         phaseTicks = 0;
         bounceStallTicks = 0;
-        wantBounceRedeploy = false;
         emergencyTicks = 0;
 
         // --- ViaVersion protocol requirement (see README "Requirements") ---
@@ -112,19 +114,65 @@ public class ElytraPilotModule extends Module {
         if (regear != null && regear.isEnabled()) regear.setEnabled(false);
     }
 
-    // ---------------------------------------------------------------- pre-physics hook (the e-bounce redeploy)
+    // ---------------------------------------------------------------- glide-state hold (the e-bounce redeploy)
 
     /**
-     * Runs once per bot tick, after the bot applies the server's fall-flying/pose metadata sync for this tick
-     * but before the physics/movement step. This is the entire point of {@link BotPrePhysicsTick}: force
-     * fall-flying back on for this tick's physics BEFORE it runs, so the client's own predicted glide never
-     * diverges from what the server is about to confirm.
+     * Re-engages fall-flying for THIS tick's physics. Module {@link ClientBotTick} subscribers run earlier
+     * in the same serialized dispatch than {@code Bot}'s own tick, and {@code Bot} re-derives its
+     * fall-flying state at the start of its tick from the cached self-entity metadata bit this writes — so
+     * a write here is consumed by the physics step of the very same tick.
+     *
+     * <p>Deliberately NOT gated on {@code BOT.isFallFlying()}: at module-subscriber time that getter still
+     * holds the previous tick's derived value; the metadata cache is the current state. On a false→true
+     * transition of the cached bit this also sends the deploy packet, mirroring the bot's own deploy path.
      */
-    private void onPrePhysics(BotPrePhysicsTick event) {
-        if (phase != Phase.BOUNCE || !wantBounceRedeploy) return;
-        double y = CACHE.getPlayerCache().getY();
-        if (y < cfg().roadY + cfg().bounceDeployHeight) return; // too low - a deploy here gets server-rejected
-        if (!BOT.isFallFlying()) BOT.setFallFlying(true);
+    private void holdBounceGlide(boolean onGround, double y) {
+        var c = cfg();
+        if (onGround) return;
+        if (y < c.roadY + c.bounceDeployHeight) return; // too low - the server won't accept a deploy here
+        // only re-engage at/near the apex: the rise stays ballistic (full gravity, low apex), the glide
+        // catches the descent
+        if (BOT.getVelocity().getY() >= c.bounceRedeployMaxVy) return;
+        if (!elytraUsable()) return;
+        if (glideBitSet()) return; // still gliding - nothing to re-engage
+        setGlideBit(true);
+        sendClientPacketAsync(new ServerboundPlayerCommandPacket(
+            CACHE.getPlayerCache().getEntityId(), PlayerState.START_ELYTRA_FLYING));
+    }
+
+    /** The cached self-entity fall-flying flag (shared flags byte, metadata index 0, bit 0x80). */
+    private boolean glideBitSet() {
+        return CACHE.getPlayerCache().getThePlayer().getMetadata().get(0) instanceof ByteEntityMetadata b
+            && (b.getPrimitiveValue() & 0x80) != 0;
+    }
+
+    /** Sets/clears the cached fall-flying flag — the value {@code Bot} derives its glide state from. */
+    private void setGlideBit(boolean glide) {
+        var metadata = CACHE.getPlayerCache().getThePlayer().getMetadata();
+        if (metadata.get(0) instanceof ByteEntityMetadata b) {
+            byte v = b.getPrimitiveValue();
+            b.setValue(glide ? (byte) (v | 0x80) : (byte) (v & ~0x80));
+        } else if (glide) {
+            metadata.put(0, new ByteEntityMetadata(0, MetadataTypes.BYTE, (byte) 0x80));
+        }
+    }
+
+    /**
+     * The essentials of the bot's own can-glide check, via public API: not in a vehicle, no levitation
+     * effect, and a usable (not fully damaged) elytra in the chestplate slot.
+     */
+    private boolean elytraUsable() {
+        var player = CACHE.getPlayerCache().getThePlayer();
+        if (player.isInVehicle()) return false;
+        if (player.getPotionEffectMap().get(Effect.LEVITATION) != null) return false;
+        ItemStack chest = CACHE.getPlayerCache().getEquipment(EquipmentSlot.CHESTPLATE);
+        if (chest == Container.EMPTY_STACK) return false;
+        ItemData itemData = ItemRegistry.REGISTRY.get(chest.getId());
+        if (itemData != ItemRegistry.ELYTRA) return false;
+        var damage = chest.getDataComponentsOrEmpty().get(DataComponentTypes.DAMAGE);
+        if (damage == null) return true;
+        var maxDamage = itemData.components().get(DataComponentTypes.MAX_DAMAGE);
+        return maxDamage == null || damage < maxDamage;
     }
 
     // ---------------------------------------------------------------- main tick
@@ -219,8 +267,7 @@ public class ElytraPilotModule extends Module {
         if (manageElytraWear()) return; // may have entered RESUPPLY
 
         boolean onGround = BOT.isOnGround();
-        boolean flying = BOT.isFallFlying();
-        if (c.bounceClearOnGround && onGround && flying) BOT.setFallFlying(false);
+        if (c.bounceClearOnGround && onGround) setGlideBit(false);
 
         double bps = velocityBps();
         if (bps < c.bounceStallSpeed) {
@@ -239,9 +286,9 @@ public class ElytraPilotModule extends Module {
             bounceStallTicks = 0;
         }
 
-        // Arm the redeploy for THIS tick's pre-physics hook (see onPrePhysics) - not a direct call here, so
-        // the force-fly happens at the correct point in Bot's own tick, after the metadata sync.
-        wantBounceRedeploy = true;
+        // Re-engage fall-flying for this tick's physics - Bot's own tick runs later in this same serialized
+        // dispatch and consumes the glide state written here (see holdBounceGlide).
+        holdBounceGlide(onGround, y);
 
         boolean wantSprint = bps < c.bounceSpeed;
         double aboveRoad = y - c.roadY;
@@ -256,7 +303,7 @@ public class ElytraPilotModule extends Module {
         submitMove(true, true, wantSprint, false, yaw, pitch);
 
         if (c.bounceDebug) {
-            info("[bounce] og={} ff={} y={} bps={} sprint={} pitch={}", onGround, flying, String.format("%.2f", y),
+            info("[bounce] og={} glide={} y={} bps={} sprint={} pitch={}", onGround, glideBitSet(), String.format("%.2f", y),
                 String.format("%.1f", bps), wantSprint, pitch);
         }
 
@@ -379,7 +426,7 @@ public class ElytraPilotModule extends Module {
             // gentle, level-ish glide down; cut fall-flying near the ground so vanilla fall damage rules
             // (feather falling / elytra glide-to-ground) apply normally rather than free-falling
             submitMove(true, false, false, false, yaw, 15f);
-            if (y - groundYGuess() < 3 && BOT.isFallFlying()) BOT.setFallFlying(false);
+            if (y - groundYGuess() < 3) setGlideBit(false);
         }
     }
 

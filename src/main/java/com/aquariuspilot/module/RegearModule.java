@@ -63,9 +63,18 @@ public class RegearModule extends AbstractFieldModule {
     private @Nullable BlockPos shulkPos;
     private @Nullable ItemData kitShulkerItem;
     private @Nullable BlockPos avoidSpot;
-    /** Shulker boxes carried on entry to {@link State#BREAK_KIT}, {@code -1} when not in that state. Needs its
-     *  own field rather than reusing {@code step}, which {@link #go} zeroes on every state change. */
-    private int shulkerBaseline = -1;
+    /**
+     * Player-inventory slots (9-44) that already held a shulker box on entry to {@link State#PULL_KIT} — i.e.
+     * the bot's <b>own</b> shulkers, none of which are Regear's to place, empty, break or deposit. Anything
+     * shulker-shaped in a slot outside this set is the kit Regear itself pulled; see
+     * {@link #findPulledShulkerSlot()}.
+     *
+     * <p>Known limitation: this assumes the bot's own shulkers stay in their slots between {@code PULL_KIT}
+     * and the return. Regear's own actions in that window (shift-click out of a container, place, break, pick
+     * up) never relocate existing inventory items, so it holds in practice — but another module rearranging
+     * the inventory mid-cycle would invalidate the mapping.
+     */
+    private final java.util.Set<Integer> foreignShulkerSlots = new java.util.HashSet<>();
 
     private boolean paused;
     private boolean complete;
@@ -103,7 +112,7 @@ public class RegearModule extends AbstractFieldModule {
         relocateAttempts = 0;
         relocateForceKill = false; pathBestDist = Double.MAX_VALUE; pathStuckTicks = 0;
         ownEchest = false; echPos = null; shulkPos = null; pathGoal = null; kitShulkerItem = null; avoidSpot = null;
-        shulkerBaseline = -1;
+        foreignShulkerSlots.clear();
         var c = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         if (c.selfKillRelocate) {
             go(State.RELOCATE);
@@ -114,9 +123,9 @@ public class RegearModule extends AbstractFieldModule {
         }
         int carried = countInInv(this::isShulkerBox);
         if (carried > 0) {
-            warn("Regear: starting while already carrying {} shulker box(es). PULL_KIT treats a shulker already "
-                + "in the inventory as the kit, so Regear may place, empty and break one of yours instead of "
-                + "pulling one from the ender chest. Stash unrelated shulkers before gearing up.", carried);
+            info("Regear: you are carrying {} shulker box(es) - they will be left alone. Regear tracks the "
+                + "specific shulker it pulls from the ender chest and only places, empties, breaks and returns "
+                + "that one.", carried);
         }
     }
 
@@ -127,11 +136,11 @@ public class RegearModule extends AbstractFieldModule {
         state = State.IDLE;
         elytraRefill = false;
         echPos = null; shulkPos = null; pathGoal = null; kitShulkerItem = null; avoidSpot = null;
-        shulkerBaseline = -1;
+        foreignShulkerSlots.clear();
     }
 
     private void onStarting(ClientBotTick.Starting event) {
-        if (state != State.IDLE && !complete) { shulkerBaseline = -1; go(State.ACQUIRE); }
+        if (state != State.IDLE && !complete) { foreignShulkerSlots.clear(); go(State.ACQUIRE); }
     }
 
     private void go(State s) { state = s; step = 0; timer = 0; attempts = 0; }
@@ -142,7 +151,7 @@ public class RegearModule extends AbstractFieldModule {
         paused = true;
         state = State.IDLE;
         elytraRefill = false;
-        shulkerBaseline = -1;
+        foreignShulkerSlots.clear();
         warn("Regear paused: {}. Toggle .aqp regear off/on to retry.", reason);
         inGameAlertActivePlayer("<red>Regear paused: " + reason);
     }
@@ -152,6 +161,7 @@ public class RegearModule extends AbstractFieldModule {
         complete = true;
         state = State.IDLE;
         elytraRefill = false;
+        foreignShulkerSlots.clear();
         info("Regear complete - geared up.");
         inGameAlertActivePlayer("<green>Regear complete");
         if (AquariusPilotPlugin.PLUGIN_CONFIG.regear.disableWhenDone) {
@@ -325,10 +335,20 @@ public class RegearModule extends AbstractFieldModule {
 
     private void tickPullKit() {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
+        // Baseline the bot's OWN shulker slots on entry to this state, before anything has been pulled: at this
+        // point the previous round's kit has already been returned to the chest (or broken and deposited), so
+        // every shulker currently held is one of the bot's own. From here to the return, a shulker in any other
+        // slot is the kit Regear pulled. Re-captured on every entry so each cherry-pick round re-baselines
+        // rather than inheriting the previous round's slots. `step` is otherwise unused in PULL_KIT and is
+        // zeroed by go(), so it doubles as the once-per-entry guard.
+        if (step == 0) { captureForeignShulkerSlots(); step = 1; }
+        // Checked before the open-container test on purpose: re-entering PULL_KIT re-captures the baseline, so
+        // a window that closes on its own the tick after a successful pull must be recognised as "got it" here
+        // rather than bounce back through OPEN_ECHEST and re-baseline the freshly pulled kit as foreign.
+        if (findPulledShulkerSlot() != -1) { go(State.CLOSE_ECHEST); return; }
         if (openContainerId() == 0) { go(State.OPEN_ECHEST); return; }
         Container c = openContainer();
         if (c == null) { timer = cfg.actionDelayTicks; return; }
-        if (findPlayerWindowSlot(c, this::isShulkerBox) != -1) { go(State.CLOSE_ECHEST); return; }
 
         // Single-item-shulker storage: skip the primary kit match entirely and cherry-pick from round 0, so a
         // shulker that merely *scores* as a kit is never dumped wholesale when selective pulls were wanted.
@@ -384,7 +404,7 @@ public class RegearModule extends AbstractFieldModule {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         switch (step) {
             case 0 -> {
-                int slot = findInInv(this::isShulkerBox);
+                int slot = findPulledShulkerSlot();
                 if (slot == -1) { abort("lost the shulker after pulling it"); return; }
                 kitShulkerItem = ItemRegistry.REGISTRY.get(CACHE.getPlayerCache().getPlayerInventory().get(slot).getId());
                 shulkPos = selectSpotBeside(avoidSpot);
@@ -450,32 +470,30 @@ public class RegearModule extends AbstractFieldModule {
 
     private void tickBreakKit() {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
-        // Baseline the carried shulkers on the first tick here, while the kit is still a placed block, so the
-        // pickup wait below is looking for *the broken kit* arriving in the inventory rather than for any
-        // shulker at all: a shulker the bot happened to already carry used to satisfy the check immediately
-        // and the real drop was left on the ground. Reset to -1 on every exit so each cherry-pick round
-        // re-baselines instead of inheriting the previous round's count.
-        if (shulkerBaseline < 0) shulkerBaseline = countInInv(this::isShulkerBox);
         if (placed(shulkPos)) {
             if (++attempts > 200) { abort("couldn't break the kit shulker"); return; }
             breakAt(shulkPos, true);
             return;
         }
         if (!BARITONE.isActive()) BARITONE.pickup();
-        boolean collected = countInInv(this::isShulkerBox) > shulkerBaseline;
+        // The recovered kit lands in a free slot, which by definition is not one of the foreign shulker slots
+        // baselined at PULL_KIT - so this waits for *the broken kit* to arrive rather than being satisfied
+        // immediately by a shulker the bot happened to already carry, which used to leave the real drop lying
+        // on the ground.
+        boolean collected = findPulledShulkerSlot() != -1;
         boolean gaveUp = !collected && ++step > 60;
         if (collected || gaveUp) {
             if (BARITONE.isActive()) BARITONE.stop();
             if (gaveUp) {
                 warn("Regear: broke the kit shulker at {} but never picked it up (gave up after ~{} ticks). "
-                    + "It is most likely still lying on the ground there - out of reach, burnt/despawned, or the "
-                    + "chunk hiccuped - and on a cherry-pick round it still holds everything that wasn't taken. "
+                    + "It is most likely still lying on the ground there - out of reach, burnt, or the chunk "
+                    + "hiccuped - and on a cherry-pick round it still holds everything that wasn't taken. "
                     + "Go recover it. Continuing the gear-up with what's already gathered.",
                     shulkPos, 60 * Math.max(1, cfg.actionDelayTicks));
                 inGameAlertActivePlayer("<yellow>Regear: broken kit shulker was not picked up - it may still be "
                     + "on the ground with items inside");
             }
-            shulkPos = null; attempts = 0; shulkerBaseline = -1;
+            shulkPos = null; attempts = 0;
             go(State.CHERRY_CHECK);
         } else {
             timer = cfg.actionDelayTicks;
@@ -503,16 +521,18 @@ public class RegearModule extends AbstractFieldModule {
         if (openContainerId() == 0) { go(State.RETURN_OPEN); return; }
         Container c = openContainer();
         if (c == null) { timer = cfg.actionDelayTicks; return; }
-        int src = findPlayerWindowSlot(c, this::isShulkerBox);
-        if (src == -1) { go(State.RETURN_CLOSE); return; }
-        if (!inventoryBusy()) shiftClick(c, src);
+        // Only ever deposit the shulker Regear itself pulled - an unrelated one the bot was already carrying is
+        // not Regear's to put in someone's ender chest. -1 means there is nothing of ours left to return.
+        int invSlot = findPulledShulkerSlot();
+        if (invSlot == -1) { go(State.RETURN_CLOSE); return; }
+        if (!inventoryBusy()) shiftClick(c, invSlotToWindowSlot(c, invSlot));
         timer = cfg.actionDelayTicks;
     }
 
     private void tickCherryCheck() {
         var cfg = AquariusPilotPlugin.PLUGIN_CONFIG.regear;
         boolean willContinue = cfg.cherryPickFallback && cherryPickAttempts < cfg.cherryPickMaxShulkers && !cherryPickSatisfied();
-        if (countInInv(this::isShulkerBox) > 0 && (willContinue || cfg.returnShulker)) { go(State.RETURN_OPEN); return; }
+        if (findPulledShulkerSlot() != -1 && (willContinue || cfg.returnShulker)) { go(State.RETURN_OPEN); return; }
         if (!willContinue) { go(ownEchest ? State.RECOVER_ECHEST : State.GEAR_UP); return; }
         cherryPickAttempts++;
         shulkPos = null; kitShulkerItem = null;
@@ -575,6 +595,45 @@ public class RegearModule extends AbstractFieldModule {
     private static final EquipmentSlot[] ARMOR_EQUIP =
         {EquipmentSlot.HELMET, EquipmentSlot.CHESTPLATE, EquipmentSlot.LEGGINGS, EquipmentSlot.BOOTS};
     private static final String[] ARMOR_SUFFIX = {"_helmet", "_chestplate", "_leggings", "_boots"};
+
+    // ------------------------------------------------- "which shulker is ours" tracking
+
+    /** Record every player-inventory slot (9-44) that currently holds a shulker box as one of the bot's own. */
+    private void captureForeignShulkerSlots() {
+        foreignShulkerSlots.clear();
+        List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        for (int i = 9; i <= 44; i++) if (isShulkerBox(inv.get(i))) foreignShulkerSlots.add(i);
+    }
+
+    /**
+     * The player-inventory slot (9-44) holding the shulker Regear pulled this round — the first shulker box in
+     * a slot that was <i>not</i> already holding one when {@link State#PULL_KIT} was entered — or {@code -1}
+     * when Regear is not currently holding a shulker of its own.
+     */
+    private int findPulledShulkerSlot() {
+        List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        for (int i = 9; i <= 44; i++) {
+            if (isShulkerBox(inv.get(i)) && !foreignShulkerSlots.contains(i)) return i;
+        }
+        return -1;
+    }
+
+    // The player portion of an open container window is its last 36 slots (main inventory then hotbar), so it
+    // lines up one-for-one with player-inventory slots 9-44. Container-window helpers (findPlayerWindowSlot,
+    // shiftClick) speak window indices; findInInv/countInInv and foreignShulkerSlots speak inventory slots.
+    // The base below matches findPlayerWindowSlot's own Math.max(0, size - 36) start index.
+
+    private static int playerWindowBase(Container c) { return Math.max(0, c.getSize() - 36); }
+
+    /** Container-window index -> player-inventory slot (9-44). */
+    private static int windowSlotToInvSlot(Container c, int windowSlot) {
+        return 9 + (windowSlot - playerWindowBase(c));
+    }
+
+    /** Player-inventory slot (9-44) -> container-window index. */
+    private static int invSlotToWindowSlot(Container c, int invSlot) {
+        return playerWindowBase(c) + (invSlot - 9);
+    }
 
     private boolean isKitShulker(@Nullable ItemStack s) {
         if (!isShulkerBox(s)) return false;

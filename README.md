@@ -22,12 +22,35 @@ Before enabling the bounce, set the outbound protocol to 1.20.4:
 via zenithToServer version 1.20.4
 ```
 
-or set it directly in `config.json` under `client.viaversion` (`enabled: true`, `protocolVersion: 765`).
+On 2b2t you also have to stop ViaVersion switching itself off there:
 
-By default this plugin **checks this on every enable** (`elytraPilot.requireProtocolCheck`, default
-`true`) and refuses to start e-bounce if the protocol isn't 765, logging a loud warning explaining why. Set
-`requireProtocolCheck` to `false` if you want to fly with only the firework cruise (which is not protocol
--sensitive) and skip the gate — but the bounce itself will still not perform well under any other protocol.
+```
+via zenithToServer on
+via zenithToServer disableOn2b2t off
+```
+
+or set it directly in `config.json` under `client.viaversion`: `enabled: true`, `disableOn2b2t: false`,
+`autoProtocolVersion: false`, `protocolVersion: 765`.
+
+**All four matter.** `protocolVersion: 765` is the stock default, so checking it alone proves nothing — an
+untouched config reads "765" while ViaVersion is disabled outright, switched off for 2b2t, or in `auto`
+mode (which ignores the version field entirely). This plugin checks the whole set, on enable **and** again
+on every (re)connect (`elytraPilot.requireProtocolCheck`, default `true`), and refuses to start if the
+downgrade is not actually active — logging exactly which of the four is wrong. `.aqp status` shows the same
+breakdown. Set `requireProtocolCheck` to `false` if you want to fly with only the firework cruise (which is
+not protocol-sensitive) and skip the gate — but the bounce itself will still not perform well under any
+other protocol.
+
+ElytraPilot also **refuses to start while stock AutoArmor is enabled** (AutoArmor fills the chest slot with
+the best chestplate it can find, which means stripping the worn elytra mid-flight), and warns loudly about
+**AntiAFK** and **AutoEat** — both enabled by default — which otherwise fight the flight for control of the
+bot. The flight's movement-input priority (`elytraPilot.inputPriority`, default 12000) outranks both.
+
+A flight is always started explicitly and never resumes on its own: ElytraPilot does not auto-enable from
+its config, refuses to enable without a target (unless `elytraPilot.allowFreeFly` is set), and clears the
+target on arrival — so a proxy restart can never silently re-fly an old route. The target dimension
+(`.aqp fly nether on/off`, `elytraPilot.targetIsNether`) is a hard pre-flight gate, not a hint: there is no
+portal traversal here, so a mismatch is refused rather than flown.
 
 Also required:
 - Java 25+ to build (JDK used to compile; ZenithProxy's plugin annotation processor requires it). The

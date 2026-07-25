@@ -6,8 +6,7 @@ import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
-
-import java.util.List;
+import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 
 import static com.zenith.Globals.CACHE;
 
@@ -49,11 +48,76 @@ public final class FlightGear {
 
     // ---------------------------------------------------------------- counts (worn + offhand + inventory)
 
-    private static List<ItemStack> inv() { return CACHE.getPlayerCache().getPlayerInventory(); }
-    private static ItemStack worn(EquipmentSlot slot) { return CACHE.getPlayerCache().getEquipment(slot); }
+    /**
+     * Every slot read in this class goes through {@link AbstractFieldModule#playerSlot(int)} rather than
+     * {@code PlayerCache#getPlayerInventory()} / {@code #getEquipment(EquipmentSlot)}, both of which read
+     * container 0 directly.
+     *
+     * <p>Container 0 is <b>stale while a container window is open</b>: the server reports menu-driven slot
+     * changes against the window id, and ZenithProxy's {@code InventoryCache} only back-populates container 0
+     * from the window's player portion when the window closes. That matters here because
+     * {@link RegearModule}'s cherry-pick calls {@link #stillNeeds} from PULL_KIT and EMPTY_KIT — i.e. with an
+     * ender chest or shulker open — so every count taken from container 0 was blind to the pulls the same
+     * cycle had just made, and Regear kept pulling items it already had.
+     *
+     * <p>Slots outside the window's player portion (armor 5-8, offhand 45) are not part of the window, so
+     * {@code playerSlot} correctly falls back to container 0 for them.
+     */
+    private static ItemStack slot(int invSlot) { return AbstractFieldModule.playerSlot(invSlot); }
+
+    /** Vanilla player-inventory index of an equipment slot; -1 for slots that are not the player's own. */
+    private static int equipInvSlot(EquipmentSlot s) {
+        return switch (s) {
+            case HELMET -> 5;
+            case CHESTPLATE -> 6;
+            case LEGGINGS -> 7;
+            case BOOTS -> 8;
+            case MAIN_HAND -> 36 + CACHE.getPlayerCache().getHeldItemSlot();
+            case OFF_HAND -> 45;
+            default -> -1;
+        };
+    }
+
+    private static ItemStack worn(EquipmentSlot slot) {
+        int i = equipInvSlot(slot);
+        return i < 0 ? Container.EMPTY_STACK : slot(i);
+    }
 
     public static boolean elytraWorn() { return isElytra(worn(EquipmentSlot.CHESTPLATE)); }
     public static int elytraCount() { return (elytraWorn() ? 1 : 0) + countItems(FlightGear::isElytra, false); }
+
+    // ---------------------------------------------------------------- elytra durability
+
+    /**
+     * Durability left on an item, or {@link Integer#MAX_VALUE} for items that do not take damage. Kept here
+     * (rather than borrowed from {@link RegearModule}, which has its own private copy) so the pre-flight
+     * gate, the cherry-pick "still needs" test and the in-flight wear watch all agree on what "fresh" means.
+     */
+    public static int remainingDurability(ItemStack s) {
+        if (s == null || s == Container.EMPTY_STACK) return 0;
+        ItemData d = ItemRegistry.REGISTRY.get(s.getId());
+        if (d == null) return 0;
+        Integer maxDamage = d.components().get(DataComponentTypes.MAX_DAMAGE);
+        if (maxDamage == null) return Integer.MAX_VALUE;
+        Integer damage = s.getDataComponentsOrEmpty().get(DataComponentTypes.DAMAGE);
+        return maxDamage - (damage == null ? 0 : damage);
+    }
+
+    /** An elytra with more than {@code elytraPilot.freshElytraMinDurability} durability left. */
+    public static boolean isFreshElytra(ItemStack s) {
+        return isElytra(s) && remainingDurability(s) > cfg().freshElytraMinDurability;
+    }
+
+    public static boolean elytraWornFresh() { return isFreshElytra(worn(EquipmentSlot.CHESTPLATE)); }
+
+    /**
+     * Elytras that can actually complete a leg — the worn one if it is fresh, plus every fresh spare.
+     * The plain {@link #elytraCount()} counts scrap, so gating the pre-flight checklist on it let the bot
+     * take off wearing a nearly-dead elytra with a bag full of equally dead ones behind it.
+     */
+    public static int freshElytraCount() {
+        return (elytraWornFresh() ? 1 : 0) + countItems(FlightGear::isFreshElytra, false);
+    }
 
     public static int armorPiecesAnywhere() {
         int n = 0;
@@ -102,9 +166,8 @@ public final class FlightGear {
 
     private static int countItems(java.util.function.Predicate<ItemStack> pred, boolean includeOffhand) {
         int n = 0;
-        List<ItemStack> inv = inv();
         for (int i = 9; i <= 44; i++) {
-            ItemStack s = inv.get(i);
+            ItemStack s = slot(i);
             if (s != Container.EMPTY_STACK && pred.test(s)) n += s.getAmount();
         }
         if (includeOffhand) {
@@ -129,7 +192,7 @@ public final class FlightGear {
      */
     public static boolean anySupplyDeficit() {
         var c = cfg();
-        return elytraCount() < Math.max(1, c.preflightMinElytras)
+        return freshElytraCount() < Math.max(1, c.preflightMinElytras)
             || armorPiecesAnywhere() < c.preflightMinArmor
             || totemCount() < c.preflightMinTotems
             || fireworkCount() < c.preflightMinFireworks
@@ -140,8 +203,8 @@ public final class FlightGear {
 
     public static boolean ready() {
         var c = cfg();
-        return elytraWorn()
-            && elytraCount() >= Math.max(1, c.preflightMinElytras)
+        return elytraWornFresh()
+            && freshElytraCount() >= Math.max(1, c.preflightMinElytras)
             && armorPiecesAnywhere() >= c.preflightMinArmor
             && totemCount() >= c.preflightMinTotems
             && (!c.preflightOffhandTotem || offhandTotem())
@@ -154,8 +217,10 @@ public final class FlightGear {
     public static String report() {
         var c = cfg();
         StringBuilder b = new StringBuilder("Pre-flight check:\n");
-        mark(b, "elytra+armor", elytraWorn() && elytraCount() >= Math.max(1, c.preflightMinElytras) && armorPiecesAnywhere() >= c.preflightMinArmor,
-            (elytraWorn() ? elytraCount() + "/" + c.preflightMinElytras + " elytra" : "NO elytra worn")
+        mark(b, "elytra+armor", elytraWornFresh() && freshElytraCount() >= Math.max(1, c.preflightMinElytras) && armorPiecesAnywhere() >= c.preflightMinArmor,
+            (elytraWornFresh() ? freshElytraCount() + "/" + c.preflightMinElytras + " fresh elytra"
+                : elytraWorn() ? "worn elytra is SPENT (" + freshElytraCount() + " fresh available)"
+                : "NO elytra worn")
                 + " + " + armorPiecesAnywhere() + "/" + c.preflightMinArmor + " armor");
         mark(b, "totems", totemCount() >= c.preflightMinTotems && (!c.preflightOffhandTotem || offhandTotem()),
             totemCount() + "/" + c.preflightMinTotems + (offhandTotem() ? ", offhand ok" : ", offhand EMPTY"));
@@ -173,7 +238,7 @@ public final class FlightGear {
     /** Would pulling this kit item help meet a still-unmet "have" deficit? Drives Regear's cherry-pick fallback. */
     public static boolean stillNeeds(ItemStack candidate) {
         var c = cfg();
-        if (isElytra(candidate))     return elytraCount() < Math.max(1, c.preflightMinElytras);
+        if (isElytra(candidate))     return isFreshElytra(candidate) && freshElytraCount() < Math.max(1, c.preflightMinElytras);
         if (isOtherArmor(candidate)) return armorStillNeeded(candidate);
         if (isTotem(candidate))      return totemCount() < c.preflightMinTotems;
         if (isFirework(candidate))   return fireworkCount() < c.preflightMinFireworks;

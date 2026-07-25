@@ -34,6 +34,15 @@ public class AquariusPilotPlugin implements ZenithProxyPlugin {
         LOG = pluginAPI.getLogger();
         LOG.info("Aquarius Pilot loading...");
         PLUGIN_CONFIG = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, AquariusPilotConfig.class);
+        // The config file is hand-editable, and several of these values are load-bearing: a zero action
+        // delay spins a state machine, a non-positive bounceRedeployMaxVy silently stops the bounce from
+        // ever re-engaging the glide, and an oversized echestScanRadius is an O(r2) synchronous world scan
+        // on the tick thread. Clamp first, then say exactly what was corrected.
+        var configFixes = PLUGIN_CONFIG.validate();
+        if (!configFixes.isEmpty()) {
+            LOG.warn("Aquarius Pilot: {} config value(s) were out of range and have been clamped:", configFixes.size());
+            for (String fix : configFixes) LOG.warn("  {}", fix);
+        }
         pluginAPI.registerModule(new RegearModule());
         pluginAPI.registerModule(new ElytraPilotModule());
         pluginAPI.registerCommand(new AqpCommand());
